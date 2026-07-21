@@ -1,0 +1,25 @@
+RedisStreams:
+  Inputs:
+  Outputs:
+    # Output streams are NOT static -- they're discovered at connect time
+    # from whichever Sample Groups are actually active on the live NSP
+    # (one stream per active group: "<redis_output_prefix>_g<group_id>",
+    # e.g. nsp1_in_g3, nsp1_in_g5). This node also writes one metadata
+    # stream, "<redis_output_prefix>_channel_map", with one entry per
+    # active group recording the exact channel ID/label order used in
+    # that group's `samples` buffer columns.
+    DynamicPerGroup:
+      enable_nwb: False
+      type_nwb: TimeSeries
+      samples:
+        # shape is (n_samples, n_channels) per batch -- n_channels is
+        # whatever cbsdk reports for that Sample Group at connect time,
+        # not a fixed graph-YAML parameter.
+        sample_type: int16
+        nwb:
+          unit: 0.25uV
+          description: Continuous data from Cerebus, one stream per active Sample Group, channel identity/order recorded in the companion channel_map stream.
+      timestamps:
+        sample_type: uint64
+      tracking_id:
+        sample_type: uint64

@@ -23,11 +23,13 @@ import json
 import logging
 import signal
 import sys
+import threading
 import time
 
 import numpy as np
 from brand import BRANDNode
-from pycbsdk import ChanInfoField, ChannelType, DeviceType, SampleRate, Session
+from pycbsdk import DeviceType, SampleRate, Session
+from pycbsdk.session import RUNLEVEL_RUNNING
 
 
 class CerebusAdapterBCM(BRANDNode):
@@ -35,7 +37,7 @@ class CerebusAdapterBCM(BRANDNode):
     def __init__(self):
         super().__init__()
         self.session = None
-        self.group_buffers = {}  # group_id -> _GroupBuffer
+        self.groups = {}  # group_id -> _GroupInfo
         self.parameter_initialization()
         self.connect_and_discover()
         signal.signal(signal.SIGINT, self.terminate)
@@ -43,23 +45,67 @@ class CerebusAdapterBCM(BRANDNode):
     def parameter_initialization(self):
         self.device_address = self.parameters['device_address']
         self.client_interface = self.parameters.get('client_interface')
+        self.shmem_instance = int(self.parameters.get('shmem_instance', 0))
         self.redis_output_prefix = self.parameters.get('redis_output_prefix', self.NAME)
-        self.batch_ms = float(self.parameters.get('batch_ms', 1.0))
+        self.connect_timeout_s = float(self.parameters.get('connect_timeout_s', 10.0))
         self.channel_map_stream = f'{self.redis_output_prefix}_channel_map'
 
+        if not self.client_interface:
+            # Confirmed empirically on this rig: a session opened with only
+            # device_address (no client_interface) can intermittently
+            # receive a DIFFERENT NSP's data for the same group id (e.g.
+            # NSP1 connected bare received group-5 batches with NSP2's
+            # channel count, alternating with its own) -- there is no
+            # "default NSP, no special config needed" case in practice here.
+            # Always set client_interface explicitly per NSP.
+            logging.warning(
+                'No client_interface set -- this has been observed to let '
+                'a different NSP\'s data leak into this session\'s streams '
+                'on this rig. Set client_interface explicitly unless you\'ve '
+                'verified this NSP/environment doesn\'t need it.')
+
     def connect_and_discover(self):
+        # shmem_instance must be distinct per concurrently-open NSP session
+        # on this rig -- without it, two Sessions for the same device_type
+        # (both LEGACY_NSP here) collide on the same shared-memory segment
+        # name and the second one silently attaches as a client to the
+        # first's buffers instead of opening its own (root-caused and fixed
+        # upstream in pycbsdk; see CLAUDE.md). Each cerebusAdapterBCM node
+        # in a multi-NSP graph needs its own shmem_instance value.
         session_kwargs = dict(device_type=DeviceType.LEGACY_NSP,
-                               device_address=self.device_address)
+                               device_address=self.device_address,
+                               shmem_instance=self.shmem_instance)
         if self.client_interface:
             session_kwargs['client_interface'] = self.client_interface
 
         logging.info(f'Connecting to NSP at {self.device_address} '
-                     f'(client_interface={self.client_interface})...')
+                     f'(client_interface={self.client_interface}, '
+                     f'shmem_instance={self.shmem_instance})...')
         try:
             self.session = Session(**session_kwargs)
         except Exception:
             logging.exception('Failed to open cbsdk Session')
             sys.exit(1)
+
+        # Session() itself returns as soon as the socket/background thread
+        # are set up -- it does NOT block until the device handshake
+        # completes. Querying channel/group config before that finishes
+        # blocks indefinitely with no diagnostic (confirmed empirically:
+        # against an unreachable device, get_group_channels() never
+        # returns). Poll runlevel with an explicit timeout instead of
+        # guessing a fixed sleep.
+        deadline = time.monotonic() + self.connect_timeout_s
+        while self.session.runlevel < RUNLEVEL_RUNNING:
+            if time.monotonic() > deadline:
+                logging.error(
+                    f'NSP at {self.device_address} never reached RUNNING '
+                    f'runlevel within {self.connect_timeout_s}s (stuck at '
+                    f'runlevel {self.session.runlevel}) -- check '
+                    f'device_address/client_interface and that the NSP is '
+                    f'powered on and broadcasting.')
+                sys.exit(1)
+            time.sleep(0.1)
+        logging.info(f'NSP at {self.device_address} reached RUNNING runlevel.')
 
         # Discover which Sample Groups are actually active (non-empty
         # channel list) right now, and which channels/labels are in each --
@@ -73,75 +119,126 @@ class CerebusAdapterBCM(BRANDNode):
             labels = [self.session.get_channel_label(ch) for ch in channel_ids]
             rate_hz = SampleRate(group_id).hz
             n_channels = len(channel_ids)
-            batch_size = max(1, round(rate_hz * self.batch_ms / 1000))
-
             stream_name = f'{self.redis_output_prefix}_g{group_id}'
-            buf = _GroupBuffer(group_id, stream_name, n_channels, batch_size,
-                                channel_ids, labels)
-            self.group_buffers[group_id] = buf
+
+            info = _GroupInfo(group_id, rate_hz, stream_name, n_channels, channel_ids, labels)
+            self.groups[group_id] = info
 
             logging.info(f'Discovered Sample Group {group_id} ({rate_hz} Hz): '
-                         f'{n_channels} channels -> stream "{stream_name}", '
-                         f'batch_size={batch_size}')
+                         f'{n_channels} channels (per get_group_channels) -> '
+                         f'stream "{stream_name}"')
 
-            self._write_channel_map(buf, rate_hz)
+            # Do NOT write the channel_map yet. Confirmed empirically that
+            # get_group_channels()'s reported count can differ from the
+            # actual delivered batch width -- e.g. group 3 here reports 165
+            # channels but every real batch has 166 (an extra
+            # zero-padded channel Blackrock's protocol apparently includes
+            # beyond the labeled list -- same pattern already documented in
+            # this repo's t12_graspcomplex_journeymode.yaml:
+            # "N_ANALOG_CHANNELS: 4  # set to N+1, because analog packets
+            # include an extra channel with padded zeros"). Calibrate from
+            # the first real batch instead of trusting the discovery-time
+            # count, and write the channel_map then.
 
-            # Register the callback last, so `buf` is fully set up before
-            # data can start arriving for it.
-            self.session.on_group(group_id, as_array=True)(
-                self._make_group_callback(buf))
+            # on_group_batch collects however many packets accumulated in
+            # one internal queue drain (~1ms/~30 packets worth at 30kHz,
+            # per pycbsdk's own docstring) and calls back once per drain
+            # with a contiguous (n_samples, n_channels) array + matching
+            # (n_samples,) timestamps -- far less Python-callback overhead
+            # than a callback per raw packet, and gives us real per-sample
+            # device timestamps (unlike Session.continuous_reader, which
+            # only accumulates samples, no timestamps).
+            self.session.on_group_batch(group_id)(self._make_batch_callback(info))
 
-        if not self.group_buffers:
+        if not self.groups:
             logging.error('No active Sample Groups found on this NSP -- '
                           'nothing to stream. Check the live Central config.')
             sys.exit(1)
 
-    def _write_channel_map(self, buf, rate_hz):
+    def _write_channel_map(self, info):
         # One-time metadata entry per active group: the exact channel
         # order used for this stream's `samples` buffer columns, so
         # downstream consumers don't have to guess (see the CLAUDE.md
         # gotcha on cbpkt_header.chid always being zero in raw packets --
         # cbsdk's get_group_channels() is what actually resolves this).
         self.r.xadd(self.channel_map_stream, {
-            'group': buf.group_id,
-            'rate_hz': rate_hz,
-            'stream_name': buf.stream_name,
-            'n_channels': buf.n_channels,
-            'channel_ids': np.array(buf.channel_ids, dtype=np.int32).tobytes(),
-            'labels': json.dumps(buf.labels),
+            'group': info.group_id,
+            'rate_hz': info.rate_hz,
+            'stream_name': info.stream_name,
+            'n_channels': info.n_channels,
+            'channel_ids': np.array(info.channel_ids, dtype=np.int32).tobytes(),
+            'labels': json.dumps(info.labels),
         })
 
-    def _make_group_callback(self, buf):
-        def on_group_packet(header, samples):
-            # Called from a pycbsdk-internal thread, once per received
-            # packet (i.e. once per time-sample across this group's
-            # channels). Keep this fast: no per-call allocation beyond
-            # what numpy's own slicing needs.
-            i = buf.count
-            buf.sample_buf[i, :] = samples
-            buf.ts_buf[i] = header.time
-            buf.count += 1
+    def _calibrate(self, info, actual_n_channels):
+        # Called once, from inside the first batch callback for this group,
+        # holding info.lock. Reconciles get_group_channels()'s reported
+        # count against what's actually arriving, and only THEN writes the
+        # channel_map -- see the comment in connect_and_discover for why
+        # the discovery-time count isn't trusted as-is.
+        expected = info.n_channels
+        if actual_n_channels != expected:
+            logging.warning(
+                f'Group {info.group_id}: get_group_channels() reported '
+                f'{expected} channels but the first real batch has '
+                f'{actual_n_channels}. Using the actual batch width for '
+                f'the channel_map. If this is more than a small padding '
+                f'difference, treat it as suspect -- on this rig, a '
+                f'larger-than-expected mismatch has meant another NSP\'s '
+                f'data was leaking into this session (see client_interface '
+                f'warning in parameter_initialization).')
+            if actual_n_channels > expected:
+                pad = actual_n_channels - expected
+                info.channel_ids = list(info.channel_ids) + [-1] * pad
+                info.labels = list(info.labels) + [f'unknown_pad_{i}' for i in range(pad)]
+            else:
+                info.channel_ids = list(info.channel_ids)[:actual_n_channels]
+                info.labels = list(info.labels)[:actual_n_channels]
+        info.n_channels = actual_n_channels
+        self._write_channel_map(info)
+        info.calibrated = True
 
-            if buf.count == buf.batch_size:
-                self._flush(buf)
+    def _make_batch_callback(self, info):
+        def on_batch(samples, timestamps):
+            # Called from a pycbsdk-internal thread. `samples` is already
+            # (n_samples, n_channels) int16 -- sample-major, matching the
+            # legacy cerebusAdapter.c convention documented in CLAUDE.md,
+            # so this stream stays compatible with existing downstream
+            # nodes (e.g. featureExtraction_and_binning.py's
+            # np.reshape(..., (n_samples, n_channels))). No reshaping needed.
+            n_samples, n_channels = samples.shape
 
-        return on_group_packet
+            if not info.calibrated:
+                with info.lock:
+                    if not info.calibrated:  # re-check inside the lock
+                        self._calibrate(info, n_channels)
+            elif n_channels != info.n_channels:
+                # Recurring mismatch after calibration -- this is the
+                # cross-NSP-contamination pattern, not a one-time padding
+                # quirk. Drop the batch rather than write inconsistent
+                # data under this stream's established schema.
+                logging.error(
+                    f'Group {info.group_id} on {info.stream_name}: batch '
+                    f'has {n_channels} channels, expected {info.n_channels} '
+                    f'(calibrated). Dropping this batch -- likely another '
+                    f'NSP\'s data leaking in; check client_interface.')
+                return
 
-    def _flush(self, buf):
-        entry = {
-            'samples': buf.sample_buf.tobytes(),
-            'timestamps': buf.ts_buf.tobytes(),
-            'tracking_id': np.uint64(buf.tracking_id).tobytes(),
-        }
-        try:
-            self.r.xadd(buf.stream_name, entry)
-        except Exception:
-            logging.exception(f'Failed to XADD to {buf.stream_name}')
-        buf.tracking_id += 1
-        buf.count = 0
+            entry = {
+                'samples': samples.tobytes(),
+                'timestamps': timestamps.astype(np.uint64).tobytes(),
+                'tracking_id': np.uint64(info.tracking_id).tobytes(),
+            }
+            try:
+                self.r.xadd(info.stream_name, entry)
+            except Exception:
+                logging.exception(f'Failed to XADD to {info.stream_name}')
+            info.tracking_id += 1
+
+        return on_batch
 
     def run(self):
-        logging.info(f'Streaming {len(self.group_buffers)} Sample Group(s) '
+        logging.info(f'Streaming {len(self.groups)} Sample Group(s) '
                      f'from {self.device_address}. Entering idle loop '
                      f'(data delivery happens via cbsdk callbacks).')
         while True:
@@ -158,22 +255,17 @@ class CerebusAdapterBCM(BRANDNode):
         sys.exit(0)
 
 
-class _GroupBuffer:
-    def __init__(self, group_id, stream_name, n_channels, batch_size, channel_ids, labels):
+class _GroupInfo:
+    def __init__(self, group_id, rate_hz, stream_name, n_channels, channel_ids, labels):
         self.group_id = group_id
+        self.rate_hz = rate_hz
         self.stream_name = stream_name
         self.n_channels = n_channels
-        self.batch_size = batch_size
         self.channel_ids = channel_ids
         self.labels = labels
-        # sample-major layout [batch_size, n_channels], matching the legacy
-        # cerebusAdapter.c convention documented in CLAUDE.md -- keeps this
-        # node's stream format compatible with existing downstream nodes
-        # (e.g. featureExtraction_and_binning.py's np.reshape(..., (n_samples, n_channels))).
-        self.sample_buf = np.zeros((batch_size, n_channels), dtype=np.int16)
-        self.ts_buf = np.zeros(batch_size, dtype=np.uint64)
-        self.count = 0
         self.tracking_id = 0
+        self.calibrated = False
+        self.lock = threading.Lock()
 
 
 if __name__ == '__main__':

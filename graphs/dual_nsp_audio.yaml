@@ -1,90 +1,62 @@
 participant_id: bcm_emu
 graph_name: dual_nsp_audio
 session_description: >
-  Stream continuous data (neural + behavioral/analog-input) from both NSPs.
+  Stream continuous data (neural + behavioral/analog-input) from both NSPs,
+  via cerebusAdapterBCM (pycbsdk-based, auto-discovering) instead of the
+  legacy raw-UDP cerebusAdapter node -- see nodes/cerebusAdapterBCM/README.md
+  for why. No packet_type/chan_per_stream/samp_freq need to be hand-specified
+  here; the node queries the live NSP for its active Sample Groups and
+  channel layout on connect, and records exactly what it found in each
+  node's "<redis_output_prefix>_channel_map" stream.
 
-  Sample Group assignments below are taken from
-  `BLACKROCK CONFIG FILES/YFY_spikeAutoThresh.ccf` (parsed with
-  `notebooks/parse_ccf.py`) -- this is a REFERENCE config, not a live query
-  of whatever's actually loaded on Central right now. Re-run
-  `parse_ccf.py` against the current live-exported .ccf and update this
-  file if the config has since changed. Long-term plan is to replace this
-  with a live cbsdk query (in progress separately); this file is the
-  interim, static-config-driven version.
+  Verified end-to-end, both nodes running concurrently through a real
+  supervisor process, against this rig's live NSP emulator (see the node's
+  README for full numbers): NSP1 produces two streams (nsp1_in_g3: neural,
+  2kHz; nsp1_in_g5: analog-input/behavioral bank incl. PS4_audio, 30kHz)
+  since neural and analog-input are on different Sample Groups there. NSP2
+  produces one combined stream (nsp2_in_g5: neural + analog-input
+  together, 30kHz, 94 channels) since both are on the same Sample Group on
+  that NSP -- columns 0-79 are neural, 80-93 are the analog-input bank,
+  per that node's channel_map (this ordering came from cbsdk's
+  get_group_channels(), not a guess). Both NSPs' PS4_audio channels
+  cross-correlate at 0.9998 -- confirmed genuinely capturing the same real
+  audio, not silence/noise.
+
+  `shmem_instance` (0/1 below, distinct per node) is required for this to
+  work correctly with both NSPs connected at once -- without it, the
+  second-opened session silently mirrors the first's data instead of
+  connecting to its own device (root-caused and fixed upstream in
+  pycbsdk; see CLAUDE.md).
 
 nodes:
   # ---------------------------------------------------------------------
   # NSP1 -- enp4s0
-  # Per YFY: neural front-end and the analog-input (BNC/behavioral) bank
-  # are on DIFFERENT Sample Groups here -- they arrive as separate packets,
-  # cleanly separable by packet_type alone. No within-packet ordering
-  # ambiguity for this NSP.
   # ---------------------------------------------------------------------
-  - name: cerebusAdapter
+  - name: cerebusAdapterBCM
     nickname: nsp1_in
-    module: ../brand-modules/brand-nsp
+    module: ../brand-modules/brand-bcm-emu
     run_priority: 99
     cpu_affinity: 2
-    redis_outputs: [nsp1_neural, nsp1_analog]
     parameters:
-      # Cerebus NSPs broadcast continuous data to the subnet broadcast
-      # address, not to their own unicast IP -- the two NSPs are told apart
-      # purely by which NIC (broadcast_device) this instance is bound to via
-      # SO_BINDTODEVICE. 51002 is the data-broadcast port used by every
-      # cerebusAdapter graph in this repo (51001 looks like NSP1's
-      # command/config-channel port instead, e.g. what Central/pycbsdk use).
-      broadcast_ip: 192.168.137.255
-      broadcast_port: 51002
-      broadcast_device: enp4s0
-      num_streams: 2
-      stream_names: [nsp1_neural, nsp1_analog]
-      # index 0: neural front-end -- YFY has 165 active channels on Sample
-      #   Group 3 (2kHz). chan_per_stream uses 256 (the hardware ceiling,
-      #   cbNUM_FE_CHANS) rather than the exact YFY-observed count of 165,
-      #   so this stays safe (no heap overflow -- see the memory-safety
-      #   gotcha in CLAUDE.md) even if more front-end channels get assigned
-      #   to this group later without this file being updated.
-      # index 1: analog-input bank (BNC/behavioral, e.g. audio/photodiode)
-      #   -- YFY has 12 active channels on Sample Group 5 (30kHz).
-      #   chan_per_stream uses 16 (cbNUM_ANAIN_CHANS, the hardware ceiling
-      #   for this bank) for the same reason.
-      # !! CONFIRM against the CURRENT live .ccf before trusting this in a
-      # real session -- YFY is one reference session's config, not
-      # necessarily what's loaded on Central right now.
-      samp_freq: [2000, 30000]
-      packet_type: [3, 5]
-      chan_per_stream: [256, 16]
-      samp_per_stream: [2, 30]  # ~1ms worth of samples per Redis entry at each rate
+      log: INFO
+      device_address: 192.168.137.128
+      client_interface: enp4s0
+      shmem_instance: 0
+      redis_output_prefix: nsp1_in
+      connect_timeout_s: 10
 
   # ---------------------------------------------------------------------
   # NSP2 -- enp5s0f3
-  # Per YFY: neural front-end AND the analog-input bank are BOTH on Sample
-  # Group 5 (30kHz) here -- i.e. the SAME packets. This is the harder case
-  # from CLAUDE.md's "chid is always zero" gotcha: this single stream will
-  # contain 256+16=272-channel buffers where which column is which
-  # electrode/BNC channel is NOT yet known (the CCF doesn't record
-  # intra-packet channel order, only group membership) -- resolving that
-  # needs either the live cbsdk group-channel-list query (in progress
-  # separately) or an empirical test. Don't assume any particular column
-  # index is a specific channel until that's verified.
   # ---------------------------------------------------------------------
-  - name: cerebusAdapter
+  - name: cerebusAdapterBCM
     nickname: nsp2_in
-    module: ../brand-modules/brand-nsp
+    module: ../brand-modules/brand-bcm-emu
     run_priority: 99
     cpu_affinity: 3
-    redis_outputs: [nsp2_neural_analog]
     parameters:
-      broadcast_ip: 192.168.137.255
-      broadcast_port: 51002
-      broadcast_device: enp5s0f3
-      num_streams: 1
-      stream_names: [nsp2_neural_analog]
-      # combined neural (80 active in YFY) + analog-input (14 active in
-      # YFY) on one Sample Group. chan_per_stream uses 272
-      # (cbNUM_ANALOG_CHANS = 256 FE + 16 ANAIN, the hard protocol ceiling
-      # for any single Sample Group packet) as the safe upper bound.
-      samp_freq: [30000]
-      packet_type: [5]
-      chan_per_stream: [272]
-      samp_per_stream: [30]
+      log: INFO
+      device_address: 192.168.137.128
+      client_interface: enp5s0f3
+      shmem_instance: 1
+      redis_output_prefix: nsp2_in
+      connect_timeout_s: 10
