@@ -1,0 +1,46 @@
+
+# Standalone smoke test for Node 3 (mediaPlayerTask) -- no NSP required.
+# Run this instead of mediaPlayerTask.yaml (the full graph) when you only want to
+# verify mpv playback + task_state/trial_info + auto_stop, with real Redis
+# but no hardware connected.
+
+parameters: {}
+
+metadata:
+  participant_id:            test
+  graph_name:                mediaPlayerTask smoke test
+  description:                standalone Node 3 test, no NSP required
+
+nodes:
+  - name:     mediaPlayerTask
+    nickname: mediaPlayerTask
+    module:   ../brand-modules/brand-bcm-emu
+    run_priority:   99
+    redis_outputs:
+      task_state: task_state
+      trial_info: trial_info
+    parameters:
+      log: INFO
+      media_file_path: ../brand-modules/brand-bcm-emu/assets/long_stroll.mp3  # TODO: fill in a real file on this machine
+      player_cmd: mpv
+      progress_update_interval_s: 1.0
+      task_state_output_stream: task_state
+      trial_info_output_stream: trial_info
+      control_nsp_recording: False
+      include_nsp_neural_timestamp: False
+      include_nsp_analog_timestamp: False
+      auto_stop_graph: True
+      auto_stop_do_save: True
+      auto_stop_do_derivatives: True
+      sync_key: sync
+      time_key: ts
+
+derivatives:
+
+  - rdb_to_mat_bcm:
+      name: rdb_to_mat_bcm.py
+      module: ../brand-modules/brand-bcm-emu
+      autorun_step: 0
+      parameters:
+        include_continuous_neural: False
+        include_channel_map: False

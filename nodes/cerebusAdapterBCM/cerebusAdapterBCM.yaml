@@ -3,18 +3,25 @@ RedisStreams:
   Outputs:
     # Output streams are NOT static -- they're discovered at connect time
     # from whichever Sample Groups are actually active on the live NSP
-    # (one stream per active group: "<redis_output_prefix>_g<group_id>",
-    # e.g. nsp1_in_g3, nsp1_in_g5). This node also writes one metadata
-    # stream, "<redis_output_prefix>_channel_map", with one entry per
-    # active group recording the exact channel ID/label order used in
-    # that group's `samples` buffer columns.
+    # (one stream per active group: "<redis_output_prefix>_g<group_id>" by
+    # default, e.g. nsp1_in_g3, nsp1_in_g5 -- overridable per group_id via
+    # the stream_name_overrides parameter, e.g. {5: nsp_neural}, for
+    # whichever group a downstream node expects under a specific
+    # hardcoded stream name). This node also writes one metadata stream,
+    # "<redis_output_prefix>_channel_map", with one entry per active group
+    # recording the exact channel ID/label order used in that group's
+    # `samples` buffer columns.
     DynamicPerGroup:
       enable_nwb: False
       type_nwb: TimeSeries
       samples:
-        # shape is (n_samples, n_channels) per batch -- n_channels is
-        # whatever cbsdk reports for that Sample Group at connect time,
-        # not a fixed graph-YAML parameter.
+        # shape is (n_channels, samples_per_entry) per entry -- channel-major,
+        # to match cerebusAdapterGem.c's convention that this graph's
+        # downstream (re_reference.py / bpExtraction.py, brand-nsp) expects.
+        # samples_per_entry is a fixed graph-YAML parameter (default 30);
+        # n_channels is whatever cbsdk reports for that Sample Group at
+        # connect time (calibrated from the first real batch), not a
+        # fixed graph-YAML parameter.
         sample_type: int16
         nwb:
           unit: 0.25uV
@@ -23,3 +30,9 @@ RedisStreams:
         sample_type: uint64
       tracking_id:
         sample_type: uint64
+      group_id:
+        # Which Sample Group this entry came from -- lets a stream be
+        # traced back to its origin even after stream_name_overrides has
+        # renamed it. Not consumed by any downstream node; passes through
+        # re_reference.py untouched like any other non-samples/ts field.
+        sample_type: int32

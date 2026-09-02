@@ -1,0 +1,36 @@
+###########################################
+# stream definitions
+###########################################
+RedisStreams:
+    Inputs:
+
+    Outputs:
+        task_state:
+            enable_nwb:                 True
+            type_nwb:                   Trial
+            state:
+                chan_per_stream:        1
+                samp_per_stream:        1
+                sample_type:            str
+                nwb:
+                    trial_state:            'state'
+                    start_trial_indicators: ['start_time']
+                    end_trial_indicators:   ['return_time']
+                    other_trial_indicators: ['playing']
+                    playing_description:    'periodic playback-progress update (time_pos field)'
+
+        trial_info:
+            enable_nwb:                 True
+            type_nwb:                   TrialInfo
+            media_file_path:
+                chan_per_stream:        1
+                samp_per_stream:        1
+                sample_type:            str
+                nwb:
+                    description:        Path to the video/audio file played for this trial
+            end_reason:
+                chan_per_stream:        1
+                samp_per_stream:        1
+                sample_type:            str
+                nwb:
+                    description:        How playback ended -- 'eof' (played to completion), 'stop'/'quit' (operator closed the player), 'error', or 'process-exited' (player process died without an end-file event)

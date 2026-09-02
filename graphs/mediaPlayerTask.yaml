@@ -1,0 +1,441 @@
+
+# graph parameters
+parameters:
+  nsp_channels: &nsp_channels 256
+  total_features: &total_features 512
+
+# metadata for supergraph
+metadata:
+  participant_id:            t19
+  graph_name:                finger complex
+  description:               complex movements of fingers
+  participant_file:          ../Data/t0/t0.yaml #! to revise
+
+# node-specific parameters
+nodes:
+
+  # ---------------------------------------------------------------------
+  # Screen recorder -- records the whole screen for the duration of the
+  # graph (ffmpeg subprocess started in run(), killed on SIGINT/terminate).
+  # Requires ~/.DISPLAY to be set (see CLAUDE.md "Display and input device
+  # paths" gotcha) -- run brand-modules/brand-emory/get_display.sh, or
+  # `echo $DISPLAY > ~/.DISPLAY`, on whichever machine launches booter.
+  # ---------------------------------------------------------------------
+  - name:     screen_recorder
+    nickname: screen_recorder
+    module:   ../brand-modules/brand-bcm-emu
+    run_priority: 99
+    cpu_affinity: 20
+    parameters:
+      log: INFO
+      format: mkv
+      crf: 23
+      record_audio: False
+      # screen_id: 0  # uncomment + set to crop to one monitor (see xrandr --listmonitors)
+
+  # ---------------------------------------------------------------------
+  # Node 3 -- task controller / media player. Replaces
+  # fingercomplexTask_commandLine (kept below, commented out, as the
+  # reference this was modeled on -- same task_state/trial_info schema and
+  # auto_stop_* handling, different task logic: video/audio playback via
+  # mpv instead of text-cue presentation).
+  # ---------------------------------------------------------------------
+  - name:     mediaPlayerTask
+    nickname: mediaPlayerTask
+    module:   ../brand-modules/brand-bcm-emu
+    run_priority:   99
+    cpu_affinity:   18 # TODO: change this when running
+    redis_outputs:
+      task_state: task_state
+      trial_info: trial_info
+    parameters:
+      log: INFO
+      media_file_path: ../brand-modules/brand-bcm-emu/assets/timeline.mov # TODO: real file path
+      player_cmd: mpv
+      progress_update_interval_s: 1.0
+      task_state_output_stream: task_state
+      trial_info_output_stream: trial_info
+      control_nsp_recording: False
+      include_nsp_neural_timestamp: False
+      nsp_neural_stream: binned_spikes
+      include_nsp_analog_timestamp: False
+      nsp_analog_stream: nsp_neural
+      auto_stop_graph: True
+      auto_stop_do_save: True
+      auto_stop_do_derivatives: True
+      sync_key: sync
+      time_key: ts
+
+  # ---------------------------------------------------------------------
+  # Node 4-6 -- threshold extraction and bandpower extraction, feeding into
+  # binning. Each of these three nodes is a separate NSP stream, each
+  # with its own channel range (0-96, 96-192, 192-256). The binning node 
+  # then combines the three threshold streams and two bandpower streams into a
+  # ---------------------------------------------------------------------
+
+  - name: bin_multiple
+    nickname: bin_multiple
+    module: ../brand-modules/brand-rice
+    run_priority: 99
+    cpu_affinity: 16
+    redis_outputs:
+      binned_spikes: binned_spikes
+    parameters:
+      chan_per_stream: [96, 96, 64, 128, 128]
+      total_channels: *total_features
+      bin_size: 10
+      log: INFO
+      input_streams: [thresh_cross_1, thresh_cross_2, thresh_cross_3, sbp_1, sbp_2]
+      input_field: [crossings, crossings, crossings, samples, samples]
+      input_dtype: [int16, int16, int16, float32, float32]
+      output_stream: binned_spikes
+      output_dtype: float32
+
+  - name: bpExtraction
+    nickname: sbp_2
+    module: ../brand-modules/brand-nsp
+    run_priority: 99
+    cpu_affinity: 14-15
+    redis_outputs:
+      sbp_2: band_power
+    parameters:
+      log: INFO
+      pack_per_call: 1 # number of redis packets to pull per loop
+      butter_lowercut: 250 # lower cutoff freq of bandpass filter
+      butter_uppercut: ~ # upper cutoff freq of bandpass filter
+      butter_order: 4 # butterworth filter order
+      enable_CAR: True
+      CAR_group_sizes: 64
+      acausal_filter_lag: 120
+      acausal_filter: ~
+      input_name: reref_neural
+      input_chan_per_stream: *nsp_channels # number of channels
+      input_samp_per_stream: 30 # number of samples per channel per redis entry
+      input_samp_freq: 30000
+      input_data_type: float32
+      use_tracking_id: True
+      timestamp_data_type: uint64
+      sync_key: sync
+      time_key: ts
+      sync_source_id: nsp_idx_1
+      neural_ch_range: [128, 256]
+      n_channels: 128
+      ch_mask_stream: z_mask_stream
+
+  - name: bpExtraction
+    nickname: sbp_1
+    module: ../brand-modules/brand-nsp
+    run_priority: 99
+    cpu_affinity: 12-13
+    redis_outputs:
+      sbp_1: band_power
+    parameters:
+      log: INFO
+      pack_per_call: 1 # number of redis packets to pull per loop
+      butter_lowercut: 250 # lower cutoff freq of bandpass filter
+      butter_uppercut: ~ # upper cutoff freq of bandpass filter
+      butter_order: 4 # butterworth filter order
+      enable_CAR: True
+      CAR_group_sizes: 64
+      acausal_filter_lag: 120
+      acausal_filter: ~
+      input_name: reref_neural
+      input_chan_per_stream: *nsp_channels # number of channels
+      input_samp_per_stream: 30 # number of samples per channel per redis entry
+      input_samp_freq: 30000
+      input_data_type: float32
+      use_tracking_id: True
+      timestamp_data_type: uint64
+      sync_key: sync
+      time_key: ts
+      sync_source_id: nsp_idx_1
+      neural_ch_range: [0, 128]
+      n_channels: 128
+      ch_mask_stream: z_mask_stream
+
+  - name: thresholdExtraction
+    nickname: thresh_cross_3
+    module: ../brand-modules/brand-nsp
+    run_priority: 99
+    cpu_affinity: 10-11
+    redis_outputs:
+      thresh_cross_3: thresh_cross
+    parameters:
+      log: INFO
+      pack_per_call: 1 # number of redis packets to pull per loop
+      thresh_mult: -3.5 # threshold Values
+      thresh_calc_len: 2000 # how much data (in buffers of data -- usually 1 ms worth) do we want to use to calculate threshold values?
+      butter_lowercut: 250 # lower cutoff freq of bandpass filter
+      butter_uppercut: ~ # upper cutoff freq of bandpass filter
+      butter_order: 4 # butterworth filter order
+      enable_CAR: False
+      output_filtered: False # Do we want to export the filtered data? Good for debugging, but makes the rdb big!
+      acausal_filter_lag: 120
+      acausal_filter: IIR
+      input_name: reref_neural
+      input_chan_per_stream: *nsp_channels # number of channels
+      input_samp_per_stream: 30 # number of samples per channel per redis entry
+      input_samp_freq: 30000
+      input_data_type: float32
+      use_tracking_id: True
+      timestamp_data_type: uint64
+      sync_key: sync
+      time_key: ts
+      sync_source_id: nsp_idx_1
+      thresholds_stream: thresholds
+      neural_ch_range: [192, 256]
+      thresholds_ch_range: [192, 256]
+      n_channels: 64
+      ch_mask_stream: z_mask_stream
+
+  - name: thresholdExtraction
+    nickname: thresh_cross_2
+    module: ../brand-modules/brand-nsp
+    run_priority: 99
+    cpu_affinity: 8-9
+    redis_outputs:
+      thresh_cross_2: thresh_cross
+    parameters:
+      log: INFO
+      pack_per_call: 1 # number of redis packets to pull per loop
+      thresh_mult: -3.5 # threshold Values
+      thresh_calc_len: 2000 # how much data (in buffers of data -- usually 1 ms worth) do we want to use to calculate threshold values?
+      butter_lowercut: 250 # lower cutoff freq of bandpass filter
+      butter_uppercut: ~ # upper cutoff freq of bandpass filter
+      butter_order: 4 # butterworth filter order
+      enable_CAR: False
+      output_filtered: False # Do we want to export the filtered data? Good for debugging, but makes the rdb big!
+      acausal_filter_lag: 120
+      acausal_filter: IIR
+      input_name: reref_neural
+      input_chan_per_stream: *nsp_channels # number of channels
+      input_samp_per_stream: 30 # number of samples per channel per redis entry
+      input_samp_freq: 30000
+      input_data_type: float32
+      use_tracking_id: True
+      timestamp_data_type: uint64
+      sync_key: sync
+      time_key: ts
+      sync_source_id: nsp_idx_1
+      thresholds_stream: thresholds
+      neural_ch_range: [96, 192]
+      thresholds_ch_range: [96, 192]
+      n_channels: 96
+      ch_mask_stream: z_mask_stream
+
+  - name: thresholdExtraction
+    nickname: thresh_cross_1
+    module: ../brand-modules/brand-nsp
+    run_priority: 99
+    cpu_affinity: 6-7
+    redis_outputs:
+      thresh_cross_1: thresh_cross
+    parameters:
+      log: INFO
+      pack_per_call: 1 # number of redis packets to pull per loop
+      thresh_mult: -3.5 # threshold Values
+      thresh_calc_len: 2000 # how much data (in buffers of data -- usually 1 ms worth) do we want to use to calculate threshold values?
+      butter_lowercut: 250 # lower cutoff freq of bandpass filter
+      butter_uppercut: ~ # upper cutoff freq of bandpass filter
+      butter_order: 4 # butterworth filter order
+      enable_CAR: False
+      output_filtered: False # Do we want to export the filtered data? Good for debugging, but makes the rdb big!
+      acausal_filter_lag: 120
+      acausal_filter: IIR
+      input_name: reref_neural
+      input_chan_per_stream: *nsp_channels # number of channels
+      input_samp_per_stream: 30 # number of samples per channel per redis entry
+      input_samp_freq: 30000
+      input_data_type: float32
+      use_tracking_id: True
+      timestamp_data_type: uint64
+      sync_key: sync
+      time_key: ts
+      sync_source_id: nsp_idx_1
+      thresholds_stream: thresholds
+      neural_ch_range: [0, 96]
+      thresholds_ch_range: [0, 96]
+      n_channels: 96
+      ch_mask_stream: z_mask_stream
+
+  - name: re_reference
+    nickname: re_ref
+    module: ../brand-modules/brand-nsp
+    run_priority: 99
+    cpu_affinity: 23
+    redis_outputs:
+      # reref_neural: rerefContinuousNeural
+    parameters:
+      log: INFO
+      input_stream_name: nsp_neural # fed by nsp1_in's neural_stream_name below
+      output_stream_name: reref_neural
+      coefs_stream_name: rereference_parameters
+      chan_per_stream: *nsp_channels
+      samp_per_stream: 30
+      chan_total: *nsp_channels
+      start_channel: 0
+      output_dtype: float32
+
+  # ---------------------------------------------------------------------
+  # Node 1
+  # ---------------------------------------------------------------------
+  # NSP1 -- enp4s0
+  # Single-NSP for now per Eric: other BrainGate sites don't hit the
+  # dual-NSP channel-merge problem because their newer Blackrock system
+  # has a higher total channel count in one box. For task testing here,
+  # ignore NSP2 entirely rather than solve the merge -- see NSP2 block
+  # below, kept commented out (not deleted) for whenever dual-NSP is
+  # actually needed.
+  #
+  # RE-ENABLED -- now testing against real NSP1 hardware; the sim block
+  # below ("Option B") is commented back out to avoid both trying to run
+  # concurrently.
+  # ---------------------------------------------------------------------
+  - name: cerebusAdapterBCM
+    nickname: nsp1_in
+    module: ../brand-modules/brand-bcm-emu
+    run_priority: 99
+    cpu_affinity: 2
+    parameters:
+      log: INFO
+      device_address: 192.168.137.128
+      client_interface: enp4s0
+      shmem_instance: 0
+      redis_output_prefix: nsp1_in
+      connect_timeout_s: 10
+      samples_per_entry: 30  # matches re_ref's samp_per_stream: 30 above
+      # Routes by real Blackrock channel_id, not Sample Group id -- immune
+      # to Central reassigning channels to different groups (confirmed on
+      # this rig: setting the front-end channels to 30kHz merged them into
+      # the same group as the already-30kHz analog-input bank). channel_id
+      # 1..n_neural_channels -> neural_stream_name, everything above that
+      # -> analog_stream_name, regardless of which/how many Sample Groups
+      # they arrive in. n_neural_channels is the only thing to change for a
+      # site with a different neural channel count.
+      n_neural_channels: 256
+      neural_stream_name: nsp_neural
+      analog_stream_name: nsp_analog
+
+  # ---------------------------------------------------------------------
+  # NSP2 -- enp5s0f3
+  # Disabled per Eric's direction above -- not used for task testing.
+  # Re-enable (and resolve the dual-NSP channel-count-merge question) only
+  # when an actual second-NSP use case comes up.
+  # ---------------------------------------------------------------------
+  # - name: cerebusAdapterBCM
+  #   nickname: nsp2_in
+  #   module: ../brand-modules/brand-bcm-emu
+  #   run_priority: 99
+  #   cpu_affinity: 3
+  #   parameters:
+  #     log: INFO
+  #     device_address: 192.168.137.128
+  #     client_interface: enp5s0f3
+  #     shmem_instance: 1
+  #     redis_output_prefix: nsp2_in
+  #     connect_timeout_s: 10
+  #     samples_per_entry: 30
+  #     # stream_name_overrides:
+  #     #   <group_id>: nsp2_neural
+
+  # ---------------------------------------------------------------------
+  # Simulated neural data ("Option B", brand-simulator-based) -- stands in
+  # for NSP1 above. mouseAdapter -> sim2D -> spike_gen_30k is
+  # brand-simulator's existing mouse-driven fake-firing-rate/spike
+  # pipeline, unmodified; nsp_neural_sim (brand-bcm-emu, new) is a thin
+  # reformatting shim reshaping spike_gen_30k's output into exactly what
+  # re_reference expects from a real cerebusAdapterBCM ('samples' +
+  # 'timestamps' fields, channel-major (chan_per_stream, samp_per_stream)
+  # int16 + uint64) -- see nsp_neural_sim.py's docstring for why the
+  # reshape/transpose is needed. Throwaway/testing-only: swap back to the
+  # real nsp1_in node above once real NSP hardware is available.
+  # ---------------------------------------------------------------------
+  # DISABLED -- swapped out for the real nsp1_in (cerebusAdapterBCM) node
+  # above now that we're testing against real NSP1 hardware instead of
+  # simulated data. Re-enable (and comment out nsp1_in again) if we need to
+  # go back to sim-only testing.
+  # - name: mouseAdapter
+  #   nickname: mouseAdapterSim
+  #   module: ../brand-modules/brand-simulator
+  #   run_priority: 99
+  #   cpu_affinity: 3
+  #   parameters:
+  #     log: INFO
+  #     samples_per_redis_stream: 1
+  #     sample_rate: 200
+  #     # TODO: site/machine-specific -- `ls /dev/input/by-id/` and either
+  #     # edit this to match your mouse, or symlink it to this name (see
+  #     # brand-modules/brand-simulator/nodes/mouseAdapter/README.md).
+  #     mouse_device: /dev/input/by-id/usb-A4Tech_USB_Mouse-event-mouse
+  #     max_samples: 6000
+
+  # - name: sim2D
+  #   nickname: sim2D
+  #   module: ../brand-modules/brand-simulator
+  #   run_priority: 99
+  #   cpu_affinity: 4
+  #   parameters:
+  #     log: INFO
+  #     n_neurons: *nsp_channels
+  #     max_v: 25.0
+  #     in_stream: mouse_vel
+  #     out_stream: firing_rates
+  #     max_samples: 6000
+
+  # - name: spike_gen_30k
+  #   nickname: spike_gen_sim
+  #   module: ../brand-modules/brand-simulator
+  #   run_priority: 99
+  #   cpu_affinity: 5
+  #   parameters:
+  #     log: INFO
+  #     fr_sample_rate: 200
+  #     sample_rate: 1000
+  #     continuous_rate: 30000
+  #     random_seed: 42
+  #     scale: 600
+  #     input_stream: firing_rates
+  #     output_stream: spike_gen_sim
+  #     n_neurons: *nsp_channels
+  #     n_start: 0
+  #     n_end: *nsp_channels
+  #     max_samples: 20000
+
+  # - name: nsp_neural_sim
+  #   nickname: nsp_neural_sim
+  #   module: ../brand-modules/brand-bcm-emu
+  #   run_priority: 99
+  #   cpu_affinity: 17
+  #   parameters:
+  #     log: INFO
+  #     input_stream: spike_gen_sim
+  #     output_stream: nsp_neural  # matches re_reference's input_stream_name above
+  #     n_channels: *nsp_channels
+  #     samp_per_stream: 30  # matches re_ref's samp_per_stream above
+  #     maxlen: 2000
+
+
+derivatives:
+
+  # Runs automatically on graph stop (mediaPlayerTask's auto_stop_do_derivatives:
+  # True triggers every derivative here), or manually via the supervisor's
+  # 'make' command. See rdb_to_mat_bcm.py's module docstring for exactly what
+  # gets written -- one .mat per stream, no per-trial slicing (this graph only
+  # has one continuous playback "trial", not many discrete ones).
+  - rdb_to_mat_bcm:
+      name: rdb_to_mat_bcm.py
+      module: ../brand-modules/brand-bcm-emu
+      autorun_step: 0
+      parameters:
+        include_continuous_neural: False  # raw 30kHz nsp_neural -- large, opt-in
+        include_channel_map: False        # opt-in, see cerebusAdapterBCM's channel_map stream
+        include_analog: True              # save nsp_analog (analog-input bank) alongside neural
+        analog_stream: nsp_analog         # must match nsp1_in's analog_stream_name above
+        # Reshape params for reref_neural/nsp_neural/nsp_analog's flattened
+        # channel-major 'samples' buffers back to (N, n_channels,
+        # samp_per_stream) -- keep in sync with nsp1_in's n_neural_channels
+        # (256) and samples_per_entry (30), and re_ref's samp_per_stream (30).
+        neural_n_channels: 256
+        analog_n_channels: 16
+        samp_per_stream: 30
+

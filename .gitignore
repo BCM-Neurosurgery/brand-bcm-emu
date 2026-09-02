@@ -1,2 +1,4 @@
 BLACKROCK CONFIG FILES/
 notebooks/data/
+assets/*.mov
+assets/*.mp3
