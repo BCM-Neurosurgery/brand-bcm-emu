@@ -1,4 +1,13 @@
 BLACKROCK CONFIG FILES/
 notebooks/data/
-assets/*.mov
-assets/*.mp3
+assets/**/*.mov
+assets/**/*.mp4
+assets/**/*.m4a
+assets/**/*.mp3
+assets/**/*.avi
+assets/**/*.mkv
+assets/**/*.wav
+assets/**/*.zip
+git_hash.o
+__pycache__/
+.DS_Store

@@ -50,7 +50,8 @@ nodes:
       trial_info: trial_info
     parameters:
       log: INFO
-      media_file_path: ../brand-modules/brand-bcm-emu/assets/timeline.mov # TODO: real file path
+      media_folder_path: ../brand-modules/brand-bcm-emu/assets/media_player
+      media_number: '10'  # selects the file whose name starts with '01_'
       player_cmd: mpv
       progress_update_interval_s: 1.0
       task_state_output_stream: task_state

@@ -14,6 +14,7 @@
 # special-case which task-controller node produced a given graph's data.
 
 import gc
+import glob
 import json
 import logging
 import os
@@ -39,10 +40,10 @@ class MediaPlayerTask(BRANDNode):
         signal.signal(signal.SIGINT, self.terminate)
 
     def parameter_initialization(self):
-        self.media_file_path = self.parameters['media_file_path']
-        if not os.path.exists(self.media_file_path):
-            raise FileNotFoundError(
-                f'media_file_path does not exist: {self.media_file_path}')
+        self.media_folder_path = self.parameters['media_folder_path']
+        self.media_number = str(self.parameters['media_number'])
+        self.media_file_path = self.resolve_media_file_path(
+            self.media_folder_path, self.media_number)
 
         self.player_cmd = self.parameters.get('player_cmd', 'mpv')
         self.player_extra_args = self.parameters.get('player_extra_args', [])
@@ -82,6 +83,24 @@ class MediaPlayerTask(BRANDNode):
 
         self.control_nsp_recording = bool(
             self.parameters.get('control_nsp_recording', False))
+
+    @staticmethod
+    def resolve_media_file_path(media_folder_path, media_number):
+        # Files in media_folder_path are named like '01_...', '02_...' --
+        # media_number ('01', '02', ...) picks the file whose name starts
+        # with that exact prefix (followed by '_'), so '1' alone won't
+        # ambiguously match '01' and '10'/'11' etc.
+        pattern = os.path.join(media_folder_path, f'{media_number}_*')
+        matches = sorted(glob.glob(pattern))
+        if not matches:
+            raise FileNotFoundError(
+                f'No file matching media_number {media_number!r} found in '
+                f'media_folder_path: {media_folder_path}')
+        if len(matches) > 1:
+            raise RuntimeError(
+                f'Multiple files match media_number {media_number!r} in '
+                f'{media_folder_path}: {matches}')
+        return matches[0]
 
     # -----------------------------------------------------------
     # NSP timestamp / task_state helpers (mirrors
@@ -165,6 +184,14 @@ class MediaPlayerTask(BRANDNode):
                f'--input-ipc-server={self.ipc_socket_path}',
                '--idle=no',
                '--really-quiet',
+               # mpv only opens a window on its own for files with a video
+               # track; audio-only files (most of this graph's media) would
+               # otherwise play with no visible window at all, leaving the
+               # operator no obvious way to stop a trial early. --force-window
+               # gives every file -- audio or video -- a window they can
+               # close (reason=quit) or press 'q'/'s' in (reason=quit/stop)
+               # to end the trial early.
+               '--force-window=yes',
                *self.player_extra_args,
                self.media_file_path]
         logging.info(f'Starting player: {" ".join(cmd)}')
