@@ -1,0 +1,641 @@
+
+# graph parameters
+parameters:
+  nsp_channels: &nsp_channels 256          # channels per hub (both hub_1 and hub_2)
+  total_features: &total_features 1024
+  n_analog_channels: &n_analog_channels 4  # cerebusAdapter_mic: 3 real inputs + 1 Blackrock zero-padded channel -- do not "fix" to 3
+  samp_freq: &samp_freq 30000              # NSP sample rate, Hz
+  samp_per_stream: &samp_per_stream 30     # samples per channel per redis entry, at samp_freq
+
+# ---------------------------------------------------------------------
+# CPU affinity anchors -- these values are copied from mediaPlayerTask.yaml,
+# which was tuned for the BCM-emu rig's own core layout. They are almost
+# certainly wrong for the Stanford machine and MUST be re-assigned to that
+# machine's actual core layout before this graph is run there. Do not guess
+# Stanford's core layout -- get the real topology (nproc/lscpu) from whoever
+# runs this on-site and fill these in.
+# ---------------------------------------------------------------------
+cpu_affinity_anchors:
+  screen_recorder:    &cpu_screen_recorder    20
+  media_player_task:  &cpu_media_player_task  18
+  bin_multiple:       &cpu_bin_multiple       16
+  bp_hub1_1:          &cpu_bp_hub1_1          12-13
+  bp_hub1_2:          &cpu_bp_hub1_2          14-15
+  bp_hub2_1:          &cpu_bp_hub2_1          24-25
+  bp_hub2_2:          &cpu_bp_hub2_2          26-27
+  thresh_hub1_1:      &cpu_thresh_hub1_1      6-7
+  thresh_hub1_2:      &cpu_thresh_hub1_2      8-9
+  thresh_hub1_3:      &cpu_thresh_hub1_3      10-11
+  thresh_hub2_1:      &cpu_thresh_hub2_1      28-29
+  thresh_hub2_2:      &cpu_thresh_hub2_2      30-31
+  thresh_hub2_3:      &cpu_thresh_hub2_3      32-33
+  re_ref_hub1:        &cpu_re_ref_hub1        23
+  re_ref_hub2:        &cpu_re_ref_hub2        34
+
+# ---------------------------------------------------------------------
+# Stanford's ACTUAL cpu_affinity assignments for their "brand" machine's
+# three cerebusAdapter instances (from their own graph config, given as-is
+# -- not derived, not ours to guess). These are real values, NOT
+# placeholders -- keep them out of cpu_affinity_anchors above so a future
+# pass that replaces those placeholders with real BCM-emu-equivalent values
+# doesn't also overwrite these.
+# ---------------------------------------------------------------------
+stanford_cpu_affinity:
+  cerebusAdapter_hub_1: &cpu_cerebusAdapter_hub_1 4-5
+  cerebusAdapter_hub_2: &cpu_cerebusAdapter_hub_2 6-7
+  cerebusAdapter_mic:   &cpu_cerebusAdapter_mic   2-3
+
+# metadata for supergraph
+metadata:
+  participant_id:            t12
+  graph_name:                dual hub (Stanford port)
+  description:               mediaPlayerTask ported to a two-hub (two independent 256-channel NSP) rig; raw neural streams stay per-hub, merge happens at the binned-feature layer
+  participant_file:          ../Data/t12/t12.yaml #! to revise
+
+# node-specific parameters
+nodes:
+
+  # ---------------------------------------------------------------------
+  # Screen recorder, mediaPlayerTask -- unchanged from mediaPlayerTask.yaml.
+  # Porting these to the Stanford rig is a later task; left here as-is so
+  # this graph loads standalone.
+  # ---------------------------------------------------------------------
+  - name:     screen_recorder
+    nickname: screen_recorder
+    machine:  puget
+    module:   ../brand-modules/brand-bcm-emu
+    run_priority: 99
+    cpu_affinity: *cpu_screen_recorder
+    parameters:
+      log: INFO
+      format: mkv
+      crf: 23
+      record_audio: False
+      # screen_id: 0  # uncomment + set to crop to one monitor (see xrandr --listmonitors)
+
+  - name:     mediaPlayerTask
+    nickname: mediaPlayerTask
+    machine:  puget
+    module:   ../brand-modules/brand-bcm-emu
+    run_priority:   99
+    cpu_affinity:   *cpu_media_player_task # TODO: change this when running
+    redis_outputs:
+      task_state: task_state
+      trial_info: trial_info
+    parameters:
+      log: INFO
+      media_file_path: ../brand-modules/brand-bcm-emu/assets/timeline.mov # TODO: real file path
+      player_cmd: mpv
+      progress_update_interval_s: 1.0
+      task_state_output_stream: task_state
+      trial_info_output_stream: trial_info
+      control_nsp_recording: False
+      include_nsp_neural_timestamp: False
+      nsp_neural_stream: binned_spikes
+      include_nsp_analog_timestamp: False
+      nsp_analog_stream: nsp_neural
+      auto_stop_graph: True
+      auto_stop_do_save: True
+      auto_stop_do_derivatives: True
+      sync_key: sync
+      time_key: ts
+
+  # ---------------------------------------------------------------------
+  # bin_multiple -- merges both hubs' feature streams into one output.
+  #
+  # input_streams is grouped BY FEATURE TYPE (all thresholds, then all
+  # band power), not by hub, so the resulting binnedFeatures layout stays
+  # isomorphic to the existing single-256-channel graph's layout
+  # (thresholds first, then band power). Output channel ranges, in order
+  # (bin_multiple assigns ranges by accumulating chan_per_stream in the
+  # order input_streams are listed -- this ordering is a design decision
+  # downstream analysis code will depend on, not an implementation detail):
+  #
+  #   stream            hub   feature type          chan_per_stream   output channel range
+  #   ----------------  ----  --------------------  ----------------  --------------------
+  #   thresh_h1_1       1     threshold crossings    96                [   0,  96)
+  #   thresh_h1_2       1     threshold crossings    96                [  96, 192)
+  #   thresh_h1_3       1     threshold crossings    64                [ 192, 256)
+  #   thresh_h2_1       2     threshold crossings    96                [ 256, 352)
+  #   thresh_h2_2       2     threshold crossings    96                [ 352, 448)
+  #   thresh_h2_3       2     threshold crossings    64                [ 448, 512)
+  #   sbp_h1_1          1     spike band power       128               [ 512, 640)
+  #   sbp_h1_2          1     spike band power       128               [ 640, 768)
+  #   sbp_h2_1          2     spike band power       128               [ 768, 896)
+  #   sbp_h2_2          2     spike band power       128               [ 896, 1024)
+  # ---------------------------------------------------------------------
+  - name: bin_multiple
+    nickname: bin_multiple
+    machine: brand
+    module: ../brand-modules/brand-rice
+    run_priority: 99
+    cpu_affinity: *cpu_bin_multiple
+    redis_outputs:
+      binned_spikes: binned_spikes
+    parameters:
+      chan_per_stream: [96, 96, 64, 96, 96, 64, 128, 128, 128, 128]
+      total_channels: *total_features
+      bin_size: 10
+      log: INFO
+      input_streams: [thresh_h1_1, thresh_h1_2, thresh_h1_3, thresh_h2_1, thresh_h2_2, thresh_h2_3, sbp_h1_1, sbp_h1_2, sbp_h2_1, sbp_h2_2]
+      input_field: [crossings, crossings, crossings, crossings, crossings, crossings, samples, samples, samples, samples]
+      input_dtype: [int16, int16, int16, int16, int16, int16, float32, float32, float32, float32]
+      output_stream: binned_spikes
+      output_dtype: float32
+
+  # ---------------------------------------------------------------------
+  # Hub 1 -- bandpower extraction (two nodes, [0,128] / [128,256] within hub)
+  # ---------------------------------------------------------------------
+  - name: bpExtraction
+    nickname: sbp_h1_1
+    machine: brand
+    module: ../brand-modules/brand-nsp
+    run_priority: 99
+    cpu_affinity: *cpu_bp_hub1_1
+    redis_outputs:
+      sbp_h1_1: band_power
+    parameters:
+      log: INFO
+      pack_per_call: 1
+      butter_lowercut: 250
+      butter_uppercut: ~
+      butter_order: 4
+      enable_CAR: True
+      CAR_group_sizes: 64
+      acausal_filter_lag: 120
+      acausal_filter: ~
+      input_name: reref_neural_hub1
+      input_chan_per_stream: *nsp_channels
+      input_samp_per_stream: *samp_per_stream
+      input_samp_freq: *samp_freq
+      input_data_type: float32
+      use_tracking_id: True
+      timestamp_data_type: uint64
+      sync_key: sync
+      time_key: ts
+      sync_source_id: nsp_idx_1
+      neural_ch_range: [0, 128]
+      n_channels: 128
+      ch_mask_stream: z_mask_stream
+
+  - name: bpExtraction
+    nickname: sbp_h1_2
+    machine: brand
+    module: ../brand-modules/brand-nsp
+    run_priority: 99
+    cpu_affinity: *cpu_bp_hub1_2
+    redis_outputs:
+      sbp_h1_2: band_power
+    parameters:
+      log: INFO
+      pack_per_call: 1
+      butter_lowercut: 250
+      butter_uppercut: ~
+      butter_order: 4
+      enable_CAR: True
+      CAR_group_sizes: 64
+      acausal_filter_lag: 120
+      acausal_filter: ~
+      input_name: reref_neural_hub1
+      input_chan_per_stream: *nsp_channels
+      input_samp_per_stream: *samp_per_stream
+      input_samp_freq: *samp_freq
+      input_data_type: float32
+      use_tracking_id: True
+      timestamp_data_type: uint64
+      sync_key: sync
+      time_key: ts
+      sync_source_id: nsp_idx_1
+      neural_ch_range: [128, 256]
+      n_channels: 128
+      ch_mask_stream: z_mask_stream
+
+  # ---------------------------------------------------------------------
+  # Hub 2 -- bandpower extraction (two nodes, [0,128] / [128,256] within hub)
+  # ---------------------------------------------------------------------
+  - name: bpExtraction
+    nickname: sbp_h2_1
+    machine: brand
+    module: ../brand-modules/brand-nsp
+    run_priority: 99
+    cpu_affinity: *cpu_bp_hub2_1
+    redis_outputs:
+      sbp_h2_1: band_power
+    parameters:
+      log: INFO
+      pack_per_call: 1
+      butter_lowercut: 250
+      butter_uppercut: ~
+      butter_order: 4
+      enable_CAR: True
+      CAR_group_sizes: 64
+      acausal_filter_lag: 120
+      acausal_filter: ~
+      input_name: reref_neural_hub2
+      input_chan_per_stream: *nsp_channels
+      input_samp_per_stream: *samp_per_stream
+      input_samp_freq: *samp_freq
+      input_data_type: float32
+      use_tracking_id: True
+      timestamp_data_type: uint64
+      sync_key: sync
+      time_key: ts
+      sync_source_id: nsp_idx_2
+      neural_ch_range: [0, 128]
+      n_channels: 128
+      ch_mask_stream: z_mask_stream
+
+  - name: bpExtraction
+    nickname: sbp_h2_2
+    machine: brand
+    module: ../brand-modules/brand-nsp
+    run_priority: 99
+    cpu_affinity: *cpu_bp_hub2_2
+    redis_outputs:
+      sbp_h2_2: band_power
+    parameters:
+      log: INFO
+      pack_per_call: 1
+      butter_lowercut: 250
+      butter_uppercut: ~
+      butter_order: 4
+      enable_CAR: True
+      CAR_group_sizes: 64
+      acausal_filter_lag: 120
+      acausal_filter: ~
+      input_name: reref_neural_hub2
+      input_chan_per_stream: *nsp_channels
+      input_samp_per_stream: *samp_per_stream
+      input_samp_freq: *samp_freq
+      input_data_type: float32
+      use_tracking_id: True
+      timestamp_data_type: uint64
+      sync_key: sync
+      time_key: ts
+      sync_source_id: nsp_idx_2
+      neural_ch_range: [128, 256]
+      n_channels: 128
+      ch_mask_stream: z_mask_stream
+
+  # ---------------------------------------------------------------------
+  # Hub 1 -- threshold extraction (three nodes, [0,96] / [96,192] / [192,256])
+  # ---------------------------------------------------------------------
+  - name: thresholdExtraction
+    nickname: thresh_h1_1
+    machine: brand
+    module: ../brand-modules/brand-nsp
+    run_priority: 99
+    cpu_affinity: *cpu_thresh_hub1_1
+    redis_outputs:
+      thresh_h1_1: thresh_cross
+    parameters:
+      log: INFO
+      pack_per_call: 1
+      thresh_mult: -3.5
+      thresh_calc_len: 2000
+      butter_lowercut: 250
+      butter_uppercut: ~
+      butter_order: 4
+      enable_CAR: False
+      output_filtered: False
+      acausal_filter_lag: 120
+      acausal_filter: IIR
+      input_name: reref_neural_hub1
+      input_chan_per_stream: *nsp_channels
+      input_samp_per_stream: *samp_per_stream
+      input_samp_freq: *samp_freq
+      input_data_type: float32
+      use_tracking_id: True
+      timestamp_data_type: uint64
+      sync_key: sync
+      time_key: ts
+      sync_source_id: nsp_idx_1
+      thresholds_stream: thresholds_hub1
+      neural_ch_range: [0, 96]
+      thresholds_ch_range: [0, 96]
+      n_channels: 96
+      ch_mask_stream: z_mask_stream
+
+  - name: thresholdExtraction
+    nickname: thresh_h1_2
+    machine: brand
+    module: ../brand-modules/brand-nsp
+    run_priority: 99
+    cpu_affinity: *cpu_thresh_hub1_2
+    redis_outputs:
+      thresh_h1_2: thresh_cross
+    parameters:
+      log: INFO
+      pack_per_call: 1
+      thresh_mult: -3.5
+      thresh_calc_len: 2000
+      butter_lowercut: 250
+      butter_uppercut: ~
+      butter_order: 4
+      enable_CAR: False
+      output_filtered: False
+      acausal_filter_lag: 120
+      acausal_filter: IIR
+      input_name: reref_neural_hub1
+      input_chan_per_stream: *nsp_channels
+      input_samp_per_stream: *samp_per_stream
+      input_samp_freq: *samp_freq
+      input_data_type: float32
+      use_tracking_id: True
+      timestamp_data_type: uint64
+      sync_key: sync
+      time_key: ts
+      sync_source_id: nsp_idx_1
+      thresholds_stream: thresholds_hub1
+      neural_ch_range: [96, 192]
+      thresholds_ch_range: [96, 192]
+      n_channels: 96
+      ch_mask_stream: z_mask_stream
+
+  - name: thresholdExtraction
+    nickname: thresh_h1_3
+    machine: brand
+    module: ../brand-modules/brand-nsp
+    run_priority: 99
+    cpu_affinity: *cpu_thresh_hub1_3
+    redis_outputs:
+      thresh_h1_3: thresh_cross
+    parameters:
+      log: INFO
+      pack_per_call: 1
+      thresh_mult: -3.5
+      thresh_calc_len: 2000
+      butter_lowercut: 250
+      butter_uppercut: ~
+      butter_order: 4
+      enable_CAR: False
+      output_filtered: False
+      acausal_filter_lag: 120
+      acausal_filter: IIR
+      input_name: reref_neural_hub1
+      input_chan_per_stream: *nsp_channels
+      input_samp_per_stream: *samp_per_stream
+      input_samp_freq: *samp_freq
+      input_data_type: float32
+      use_tracking_id: True
+      timestamp_data_type: uint64
+      sync_key: sync
+      time_key: ts
+      sync_source_id: nsp_idx_1
+      thresholds_stream: thresholds_hub1
+      neural_ch_range: [192, 256]
+      thresholds_ch_range: [192, 256]
+      n_channels: 64
+      ch_mask_stream: z_mask_stream
+
+  # ---------------------------------------------------------------------
+  # Hub 2 -- threshold extraction (three nodes, [0,96] / [96,192] / [192,256])
+  # ---------------------------------------------------------------------
+  - name: thresholdExtraction
+    nickname: thresh_h2_1
+    machine: brand
+    module: ../brand-modules/brand-nsp
+    run_priority: 99
+    cpu_affinity: *cpu_thresh_hub2_1
+    redis_outputs:
+      thresh_h2_1: thresh_cross
+    parameters:
+      log: INFO
+      pack_per_call: 1
+      thresh_mult: -3.5
+      thresh_calc_len: 2000
+      butter_lowercut: 250
+      butter_uppercut: ~
+      butter_order: 4
+      enable_CAR: False
+      output_filtered: False
+      acausal_filter_lag: 120
+      acausal_filter: IIR
+      input_name: reref_neural_hub2
+      input_chan_per_stream: *nsp_channels
+      input_samp_per_stream: *samp_per_stream
+      input_samp_freq: *samp_freq
+      input_data_type: float32
+      use_tracking_id: True
+      timestamp_data_type: uint64
+      sync_key: sync
+      time_key: ts
+      sync_source_id: nsp_idx_2
+      thresholds_stream: thresholds_hub2
+      neural_ch_range: [0, 96]
+      thresholds_ch_range: [0, 96]
+      n_channels: 96
+      ch_mask_stream: z_mask_stream
+
+  - name: thresholdExtraction
+    nickname: thresh_h2_2
+    machine: brand
+    module: ../brand-modules/brand-nsp
+    run_priority: 99
+    cpu_affinity: *cpu_thresh_hub2_2
+    redis_outputs:
+      thresh_h2_2: thresh_cross
+    parameters:
+      log: INFO
+      pack_per_call: 1
+      thresh_mult: -3.5
+      thresh_calc_len: 2000
+      butter_lowercut: 250
+      butter_uppercut: ~
+      butter_order: 4
+      enable_CAR: False
+      output_filtered: False
+      acausal_filter_lag: 120
+      acausal_filter: IIR
+      input_name: reref_neural_hub2
+      input_chan_per_stream: *nsp_channels
+      input_samp_per_stream: *samp_per_stream
+      input_samp_freq: *samp_freq
+      input_data_type: float32
+      use_tracking_id: True
+      timestamp_data_type: uint64
+      sync_key: sync
+      time_key: ts
+      sync_source_id: nsp_idx_2
+      thresholds_stream: thresholds_hub2
+      neural_ch_range: [96, 192]
+      thresholds_ch_range: [96, 192]
+      n_channels: 96
+      ch_mask_stream: z_mask_stream
+
+  - name: thresholdExtraction
+    nickname: thresh_h2_3
+    machine: brand
+    module: ../brand-modules/brand-nsp
+    run_priority: 99
+    cpu_affinity: *cpu_thresh_hub2_3
+    redis_outputs:
+      thresh_h2_3: thresh_cross
+    parameters:
+      log: INFO
+      pack_per_call: 1
+      thresh_mult: -3.5
+      thresh_calc_len: 2000
+      butter_lowercut: 250
+      butter_uppercut: ~
+      butter_order: 4
+      enable_CAR: False
+      output_filtered: False
+      acausal_filter_lag: 120
+      acausal_filter: IIR
+      input_name: reref_neural_hub2
+      input_chan_per_stream: *nsp_channels
+      input_samp_per_stream: *samp_per_stream
+      input_samp_freq: *samp_freq
+      input_data_type: float32
+      use_tracking_id: True
+      timestamp_data_type: uint64
+      sync_key: sync
+      time_key: ts
+      sync_source_id: nsp_idx_2
+      thresholds_stream: thresholds_hub2
+      neural_ch_range: [192, 256]
+      thresholds_ch_range: [192, 256]
+      n_channels: 64
+      ch_mask_stream: z_mask_stream
+
+  # ---------------------------------------------------------------------
+  # Acquisition (L1) -- Stanford's three cerebusAdapter instances, transcribed
+  # as-given from their own graph config. module: ../brand-modules/brand-stanford
+  # does not resolve in this repo (brand-stanford isn't checked out here) --
+  # that's expected, this graph targets Stanford's rig only and won't load/run
+  # locally. machine: brand matches the rest of the acquisition/feature-
+  # extraction chain below, per Stanford's brand/puget machine split.
+  #
+  # broadcast_ip / broadcast_device are NOT included below -- Stanford's
+  # message to us only specified broadcast_port (+ the stream-shape params),
+  # not the NIC/IP side of the socket config, and those aren't ours to guess
+  # (see CLAUDE.md's CerebusAdapter networking notes on broadcast_ip binding
+  # to the subnet broadcast address and broadcast_device picking the NIC).
+  # Fill these in from Stanford's actual config before this graph can load.
+  # ---------------------------------------------------------------------
+  - name: cerebusAdapter
+    nickname: cerebusAdapter_hub_1
+    machine: brand
+    module: ../brand-modules/brand-stanford # does not resolve locally -- Stanford-only, see comment above
+    run_priority: 99
+    cpu_affinity: *cpu_cerebusAdapter_hub_1
+    redis_outputs:
+      continuousNeural_hub_1: ContinuousNeural
+    parameters:
+      # broadcast_ip: # TODO: Stanford's subnet broadcast address for hub 1, not given
+      broadcast_port: 51002
+      # broadcast_device: # TODO: Stanford's NIC for hub 1, not given
+      num_streams: 1
+      stream_names: [continuousNeural_hub_1]
+      samp_freq: [*samp_freq]
+      packet_type: [5]
+      chan_per_stream: [*nsp_channels]
+      samp_per_stream: [*samp_per_stream]
+
+  - name: cerebusAdapter
+    nickname: cerebusAdapter_hub_2
+    machine: brand
+    module: ../brand-modules/brand-stanford # does not resolve locally -- Stanford-only, see comment above
+    run_priority: 99
+    cpu_affinity: *cpu_cerebusAdapter_hub_2
+    redis_outputs:
+      continuousNeural_hub_2: ContinuousNeural
+    parameters:
+      # broadcast_ip: # TODO: Stanford's subnet broadcast address for hub 2, not given
+      broadcast_port: 51003
+      # broadcast_device: # TODO: Stanford's NIC for hub 2, not given
+      num_streams: 1
+      stream_names: [continuousNeural_hub_2]
+      samp_freq: [*samp_freq]
+      packet_type: [5]
+      chan_per_stream: [*nsp_channels]
+      samp_per_stream: [*samp_per_stream]
+
+  - name: cerebusAdapter
+    nickname: cerebusAdapter_mic
+    machine: brand
+    module: ../brand-modules/brand-stanford # does not resolve locally -- Stanford-only, see comment above
+    run_priority: 99
+    cpu_affinity: *cpu_cerebusAdapter_mic
+    redis_outputs:
+      continuousAnalog: ContinuousAnalog
+    parameters:
+      # broadcast_ip: # TODO: Stanford's subnet broadcast address for the mic/analog adapter, not given
+      broadcast_port: 51001
+      # broadcast_device: # TODO: Stanford's NIC for the mic/analog adapter, not given
+      num_streams: 1
+      stream_names: [continuousAnalog]
+      samp_freq: [*samp_freq]
+      packet_type: [5]
+      chan_per_stream: [*n_analog_channels] # 3 real analog inputs + 1 Blackrock zero-padded channel
+      samp_per_stream: [*samp_per_stream]
+
+  # ---------------------------------------------------------------------
+  # Re-referencing, one node per hub. Both nodes share one global 512x512
+  # coefficient matrix (chan_total: 512) and each slices out its own
+  # contiguous 256-channel diagonal block via start_channel -- this is the
+  # mechanism re_reference.py's initialize_coefficients() already supports
+  # (see CLAUDE.md context / task notes). NOTE: the rereference_parameters
+  # stream itself is NOT produced anywhere in this graph (out of scope for
+  # this session -- blocked on t12's electrode mapping JSON), so both nodes
+  # currently run on the fallback "subtract mean of own hub" path.
+  #
+  # Input streams (continuousNeural_hub_1 / continuousNeural_hub_2) match
+  # the cerebusAdapter_hub_1 / cerebusAdapter_hub_2 nodes' redis_outputs above
+  # exactly.
+  # ---------------------------------------------------------------------
+  - name: re_reference
+    nickname: re_ref_hub1
+    machine: brand
+    module: ../brand-modules/brand-nsp
+    run_priority: 99
+    cpu_affinity: *cpu_re_ref_hub1
+    redis_outputs:
+      # reref_neural_hub1: rerefContinuousNeural
+    parameters:
+      log: INFO
+      input_stream_name: continuousNeural_hub_1
+      output_stream_name: reref_neural_hub1
+      coefs_stream_name: rereference_parameters
+      chan_per_stream: *nsp_channels
+      samp_per_stream: *samp_per_stream
+      chan_total: 512
+      start_channel: 0
+      output_dtype: float32
+
+  - name: re_reference
+    nickname: re_ref_hub2
+    machine: brand
+    module: ../brand-modules/brand-nsp
+    run_priority: 99
+    cpu_affinity: *cpu_re_ref_hub2
+    redis_outputs:
+      # reref_neural_hub2: rerefContinuousNeural
+    parameters:
+      log: INFO
+      input_stream_name: continuousNeural_hub_2
+      output_stream_name: reref_neural_hub2
+      coefs_stream_name: rereference_parameters
+      chan_per_stream: *nsp_channels
+      samp_per_stream: *samp_per_stream
+      chan_total: 512
+      start_channel: 256
+      output_dtype: float32
+
+derivatives:
+
+  # Unchanged from mediaPlayerTask.yaml -- porting this (output shape,
+  # neural_n_channels/analog_n_channels for two hubs, etc.) is a later task.
+  - rdb_to_mat_bcm:
+      name: rdb_to_mat_bcm.py
+      module: ../brand-modules/brand-bcm-emu
+      autorun_step: 0
+      parameters:
+        include_continuous_neural: False
+        include_channel_map: False
+        include_analog: True
+        analog_stream: nsp_analog # TODO: points to nothing in this graph -- analog layer not yet ported.
+        neural_n_channels: 256
+        analog_n_channels: 4  # matches n_analog_channels at the top of this file, NOT the 16 from mediaPlayerTask.yaml's single-NSP analog-input bank -- Stanford's cerebusAdapter_mic has a different channel count
+        samp_per_stream: 30
