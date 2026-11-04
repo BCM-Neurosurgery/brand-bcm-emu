@@ -72,6 +72,17 @@ class MediaPlayerTask(BRANDNode):
             'nsp_analog_stream', 'nsp_neural')
         self.warned_no_analog_stream = False
 
+        # Second neural hub (e.g. Stanford's two-hub rig), under Stanford's
+        # parameter names. Off by default, and its fields are only written
+        # when on, so single-hub graphs produce exactly the same entries as
+        # before. Both hubs' timestamps in one entry let us check offline
+        # whether the hubs share a clock.
+        self.include_nsp_neural_timestamp_hub_2 = bool(
+            self.parameters.get('include_nsp_neural_timestamp_hub_2', False))
+        self.nsp_neural_stream_hub_2 = self.parameters.get(
+            'nsp_neural_stream_hub_2', 'continuousNeural_hub_2')
+        self.warned_no_neural_stream_hub_2 = False
+
         self.auto_stop_graph = bool(
             self.parameters.get('auto_stop_graph', True))
         self.auto_stop_do_save = bool(
@@ -116,6 +127,18 @@ class MediaPlayerTask(BRANDNode):
                 recent_nsp_neural_timestamp = np.frombuffer(
                     entry[0][1][b'timestamps'], dtype=np.uint64)[-1]
 
+        recent_nsp_neural_timestamp_hub_2 = 1
+        if self.include_nsp_neural_timestamp_hub_2:
+            entry = self.r.xrevrange(self.nsp_neural_stream_hub_2, count=1)
+            if entry:
+                recent_nsp_neural_timestamp_hub_2 = np.frombuffer(
+                    entry[0][1][b'timestamps'], dtype=np.uint64)[-1]
+            elif not self.warned_no_neural_stream_hub_2:
+                logging.warning(
+                    f'No hub 2 neural stream ({self.nsp_neural_stream_hub_2}) '
+                    'found in redis.')
+                self.warned_no_neural_stream_hub_2 = True
+
         recent_nsp_analog_timestamp = 1
         if self.include_nsp_analog_timestamp:
             entry = self.r.xrevrange(self.nsp_analog_stream, count=1)
@@ -126,14 +149,16 @@ class MediaPlayerTask(BRANDNode):
                 logging.warning('No analog stream found in redis.')
                 self.warned_no_analog_stream = True
 
-        return recent_nsp_neural_timestamp, recent_nsp_analog_timestamp
+        return (recent_nsp_neural_timestamp, recent_nsp_neural_timestamp_hub_2,
+                recent_nsp_analog_timestamp)
 
     def get_current_redis_time_ms(self):
         t = self.r.time()
         return int(t[0] * 1000 + t[1] / 1000)
 
     def write_task_state(self, state, extra=None):
-        nsp_neural_time, nsp_analog_time = self.get_recent_nsp_timestamp()
+        nsp_neural_time, nsp_neural_time_hub_2, nsp_analog_time = \
+            self.get_recent_nsp_timestamp()
         entry = {
             'state': state,
             'redis_timestamp': np.uint64(self.get_current_redis_time_ms()).tobytes(),
@@ -142,6 +167,9 @@ class MediaPlayerTask(BRANDNode):
             self.sync_key: 0,
             self.time_key: np.uint64(time.monotonic_ns()).tobytes(),
         }
+        if self.include_nsp_neural_timestamp_hub_2:
+            entry['nsp_neural_timestamp_hub_2'] = \
+                np.uint64(nsp_neural_time_hub_2).tobytes()
         if extra:
             entry.update(extra)
         self.r.xadd(self.task_state_output_stream, entry)
@@ -299,8 +327,8 @@ class MediaPlayerTask(BRANDNode):
             time.sleep(3)
 
         trial_start_redis_time = self.get_current_redis_time_ms()
-        trial_start_nsp_neural_time, trial_start_nsp_analog_time = \
-            self.get_recent_nsp_timestamp()
+        (trial_start_nsp_neural_time, trial_start_nsp_neural_time_hub_2,
+         trial_start_nsp_analog_time) = self.get_recent_nsp_timestamp()
         self.write_task_state('start_time', {'media_file_path': self.media_file_path})
 
         self.start_player()
@@ -308,12 +336,12 @@ class MediaPlayerTask(BRANDNode):
         self.stop_player()
 
         trial_end_redis_time = self.get_current_redis_time_ms()
-        trial_end_nsp_neural_time, trial_end_nsp_analog_time = \
-            self.get_recent_nsp_timestamp()
+        (trial_end_nsp_neural_time, trial_end_nsp_neural_time_hub_2,
+         trial_end_nsp_analog_time) = self.get_recent_nsp_timestamp()
         finished_naturally = (end_reason == 'eof')
         self.write_task_state('return_time', {'end_reason': end_reason})
 
-        self.r.xadd(self.trial_info_output_stream, {
+        trial_info = {
             'media_file_path': self.media_file_path,
             'trial_start_redis_time': np.uint64(trial_start_redis_time).tobytes(),
             'trial_start_nsp_neural_time': np.uint64(trial_start_nsp_neural_time).tobytes(),
@@ -325,7 +353,13 @@ class MediaPlayerTask(BRANDNode):
             'finished_naturally': int(finished_naturally),
             self.sync_key: 0,
             self.time_key: np.uint64(time.monotonic_ns()).tobytes(),
-        })
+        }
+        if self.include_nsp_neural_timestamp_hub_2:
+            trial_info['trial_start_nsp_neural_time_hub_2'] = \
+                np.uint64(trial_start_nsp_neural_time_hub_2).tobytes()
+            trial_info['trial_end_nsp_neural_time_hub_2'] = \
+                np.uint64(trial_end_nsp_neural_time_hub_2).tobytes()
+        self.r.xadd(self.trial_info_output_stream, trial_info)
 
         if self.control_nsp_recording:
             # send command to stop central file recording, same as
