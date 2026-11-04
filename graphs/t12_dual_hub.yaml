@@ -132,12 +132,12 @@ nodes:
       # stopped at block end (updateParameters is_stop_recording_requested).
       control_nsp_recording: True
       # NSP timestamps embedded in task_state/trial_info, for checking later
-      # whether the two hubs share a clock. Only hub 1's neural timestamp is
-      # captured: mediaPlayerTask supports a single nsp_neural_stream, so
-      # hub 2's (continuousNeural_hub_2) isn't recorded yet -- that needs a
-      # separate code change to the node.
+      # whether the two hubs share a clock (compare the hub 1 and hub 2
+      # values in the same entry).
       include_nsp_neural_timestamp: True
       nsp_neural_stream: continuousNeural_hub_1
+      include_nsp_neural_timestamp_hub_2: True
+      nsp_neural_stream_hub_2: continuousNeural_hub_2
       include_nsp_analog_timestamp: True
       nsp_analog_stream: continuousAnalog
       auto_stop_graph: True
