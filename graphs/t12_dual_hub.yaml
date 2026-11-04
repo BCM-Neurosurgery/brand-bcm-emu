@@ -8,34 +8,70 @@ parameters:
   samp_per_stream: &samp_per_stream 30     # samples per channel per redis entry, at samp_freq
 
 # ---------------------------------------------------------------------
-# CPU affinity anchors -- these values are copied from mediaPlayerTask.yaml,
-# which was tuned for the BCM-emu rig's own core layout. They are almost
-# certainly wrong for the Stanford machine and MUST be re-assigned to that
-# machine's actual core layout before this graph is run there. Do not guess
-# Stanford's core layout -- get the real topology (nproc/lscpu) from whoever
-# runs this on-site and fill these in.
+# CPU affinity anchors.
+#
+# History: the hub-1 values here originally came from our BCM-emu rig
+# (mediaPlayerTask.yaml). The hub-2 values (24-34) were NEW, invented when
+# hub 2 was added, and never validated -- mediaPlayerTask.yaml only uses
+# cores 2-23, so they were not copied from anywhere. Stanford's brand-pc
+# has no cores above 23, so those six hub-2 nodes would have failed to
+# launch.
+#
+# Stanford's brand-pc topology (0-23):
+#   0-15   performance cores, as dual-thread (hyperthread) pairs
+#   16-23  efficiency cores, single-thread
+# Reserved: 2-7 for Stanford's three cerebusAdapters, 22 for
+# centrals_interface (both in stanford_cpu_affinity below).
+#
+# Budget in 8-23: 4 P-core pairs (8-9, 10-11, 12-13, 14-15) + 8 E-cores
+# (16-23) = 12 slots. Brand-machine nodes in this block: 2 re_reference +
+# 6 thresholdExtraction + 4 bpExtraction + bin_multiple = 13, plus
+# centrals_interface already on 22 = 14 occupants for 12 slots. It does
+# NOT fit one-per-slot; two slots are doubled:
+#   - 22: bin_multiple shares with centrals_interface. centrals_interface
+#     is idle between recording start/stop, and bin_multiple is the
+#     lightest node here (bins every 10 ms, no filtering).
+#   - 14-15: thresh_hub1_3 and thresh_hub2_3 share one P-core pair. They
+#     are the two smallest threshold nodes (64 ch each), and a pair has
+#     two hardware threads, so each gets a hyperthread rather than
+#     time-sharing one single-thread E-core.
+# Filtering-heavy nodes get P-cores first. thresholdExtraction is ranked
+# above bpExtraction because it also runs the acausal IIR (lag 120) where
+# bpExtraction is causal-only -- judged from the config, NOT measured.
+# Since there are 5 P-core thresh slots for 6 thresh nodes, thresh_hub2_2
+# lands on an E-core while its hub-1 counterpart is on a P pair.
+#
+# OPEN QUESTION FOR STANFORD: E-cores are single-thread, and we have not
+# measured whether any of these nodes (including re_reference's 256x256
+# matmul per 1 ms entry) holds 1000 Hz on one. Don't resolve this by
+# guessing -- confirm on their machine before relying on this layout.
+#
+# screen_recorder / media_player_task run on machine: puget, not brand, so
+# they are outside this budget; their values are still our rig's and are
+# unvalidated for Stanford's puget.
 # ---------------------------------------------------------------------
 cpu_affinity_anchors:
-  screen_recorder:    &cpu_screen_recorder    20
-  media_player_task:  &cpu_media_player_task  18
-  bin_multiple:       &cpu_bin_multiple       16
-  bp_hub1_1:          &cpu_bp_hub1_1          12-13
-  bp_hub1_2:          &cpu_bp_hub1_2          14-15
-  bp_hub2_1:          &cpu_bp_hub2_1          24-25
-  bp_hub2_2:          &cpu_bp_hub2_2          26-27
-  thresh_hub1_1:      &cpu_thresh_hub1_1      6-7
-  thresh_hub1_2:      &cpu_thresh_hub1_2      8-9
-  thresh_hub1_3:      &cpu_thresh_hub1_3      10-11
-  thresh_hub2_1:      &cpu_thresh_hub2_1      28-29
-  thresh_hub2_2:      &cpu_thresh_hub2_2      30-31
-  thresh_hub2_3:      &cpu_thresh_hub2_3      32-33
-  re_ref_hub1:        &cpu_re_ref_hub1        23
-  re_ref_hub2:        &cpu_re_ref_hub2        34
+  screen_recorder:    &cpu_screen_recorder    20     # puget -- our rig's value, unvalidated
+  media_player_task:  &cpu_media_player_task  18     # puget -- our rig's value, unvalidated
+  thresh_hub1_1:      &cpu_thresh_hub1_1      8-9    # P pair
+  thresh_hub1_2:      &cpu_thresh_hub1_2      10-11  # P pair
+  thresh_hub2_1:      &cpu_thresh_hub2_1      12-13  # P pair
+  thresh_hub1_3:      &cpu_thresh_hub1_3      14-15  # P pair, DOUBLED with thresh_hub2_3
+  thresh_hub2_3:      &cpu_thresh_hub2_3      14-15  # P pair, DOUBLED with thresh_hub1_3
+  thresh_hub2_2:      &cpu_thresh_hub2_2      16     # E-core
+  bp_hub1_1:          &cpu_bp_hub1_1          17     # E-core
+  bp_hub1_2:          &cpu_bp_hub1_2          18     # E-core
+  bp_hub2_1:          &cpu_bp_hub2_1          19     # E-core
+  bp_hub2_2:          &cpu_bp_hub2_2          20     # E-core
+  re_ref_hub1:        &cpu_re_ref_hub1        21     # E-core
+  bin_multiple:       &cpu_bin_multiple       22     # E-core, DOUBLED with centrals_interface
+  re_ref_hub2:        &cpu_re_ref_hub2        23     # E-core
 
 # ---------------------------------------------------------------------
 # Stanford's ACTUAL cpu_affinity assignments for their "brand" machine's
-# three cerebusAdapter instances (from their own graph config, given as-is
-# -- not derived, not ours to guess). These are real values, NOT
+# three cerebusAdapter instances and centrals_interface (from their own
+# graph config, given as-is -- not derived, not ours to guess). These are
+# real values, NOT
 # placeholders -- keep them out of cpu_affinity_anchors above so a future
 # pass that replaces those placeholders with real BCM-emu-equivalent values
 # doesn't also overwrite these.
@@ -44,6 +80,7 @@ stanford_cpu_affinity:
   cerebusAdapter_hub_1: &cpu_cerebusAdapter_hub_1 4-5
   cerebusAdapter_hub_2: &cpu_cerebusAdapter_hub_2 6-7
   cerebusAdapter_mic:   &cpu_cerebusAdapter_mic   2-3
+  centrals_interface:   &cpu_centrals_interface   22
 
 # metadata for supergraph
 metadata:
@@ -56,9 +93,10 @@ metadata:
 nodes:
 
   # ---------------------------------------------------------------------
-  # Screen recorder, mediaPlayerTask -- unchanged from mediaPlayerTask.yaml.
-  # Porting these to the Stanford rig is a later task; left here as-is so
-  # this graph loads standalone.
+  # Screen recorder, mediaPlayerTask. screen_recorder is unchanged from
+  # mediaPlayerTask.yaml (porting it to the Stanford rig is a later task).
+  # mediaPlayerTask is the same except for its NSP parameters, which are
+  # set for this rig (see the comments on them below).
   # ---------------------------------------------------------------------
   - name:     screen_recorder
     nickname: screen_recorder
@@ -90,11 +128,18 @@ nodes:
       progress_update_interval_s: 1.0
       task_state_output_stream: task_state
       trial_info_output_stream: trial_info
-      control_nsp_recording: False
-      include_nsp_neural_timestamp: False
-      nsp_neural_stream: binned_spikes
-      include_nsp_analog_timestamp: False
-      nsp_analog_stream: nsp_neural
+      # True so the Central recording that centrals_interface starts gets
+      # stopped at block end (updateParameters is_stop_recording_requested).
+      control_nsp_recording: True
+      # NSP timestamps embedded in task_state/trial_info, for checking later
+      # whether the two hubs share a clock. Only hub 1's neural timestamp is
+      # captured: mediaPlayerTask supports a single nsp_neural_stream, so
+      # hub 2's (continuousNeural_hub_2) isn't recorded yet -- that needs a
+      # separate code change to the node.
+      include_nsp_neural_timestamp: True
+      nsp_neural_stream: continuousNeural_hub_1
+      include_nsp_analog_timestamp: True
+      nsp_analog_stream: continuousAnalog
       auto_stop_graph: True
       auto_stop_do_save: True
       auto_stop_do_derivatives: True
@@ -571,6 +616,34 @@ nodes:
       packet_type: [5]
       chan_per_stream: [*n_analog_channels] # 3 real analog inputs + 1 Blackrock zero-padded channel
       samp_per_stream: [*samp_per_stream]
+
+  # ---------------------------------------------------------------------
+  # centrals_interface -- starts/stops Central's recording, transcribed
+  # as-given from Stanford's own graph config. module:
+  # ../brand-modules/brand-stanford does not resolve in this repo
+  # (brand-stanford isn't checked out here), same as the three
+  # cerebusAdapter nodes above -- expected, this graph targets Stanford's
+  # rig only. Stanford runs their own fork of this node: it takes
+  # is_start/stop_recording_requested + recording_save_path directly, which
+  # does NOT match brand-nsp/nodes/centrals_interface/centrals_interface.py
+  # (env_file_path + block_metadata instead; that file's README still
+  # documents the params used here). cpu_affinity 22 is Stanford's real
+  # value, kept in stanford_cpu_affinity above. mediaPlayerTask stops the
+  # recording at block end via updateParameters on this nickname.
+  #
+  # recording_save_path is Stanford's value as given -- confirm the actual
+  # PC1 save path for this graph/block before relying on it.
+  # ---------------------------------------------------------------------
+  - name: centrals_interface
+    nickname: centrals_interface
+    machine: brand
+    module: ../brand-modules/brand-stanford # does not resolve locally -- Stanford-only, see comment above
+    cpu_affinity: *cpu_centrals_interface
+    parameters:
+      log: INFO
+      is_start_recording_requested: true
+      is_stop_recording_requested: false
+      recording_save_path: 'E:/Session/Data/_NSP1' # TODO: confirm actual PC1 save path for this graph/block
 
   # ---------------------------------------------------------------------
   # Re-referencing, one node per hub. Both nodes share one global 512x512
